@@ -14,6 +14,7 @@
 #include <Protocol/SimpleFileSystem.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
+#include "CpuHandoff.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
 
@@ -38,10 +39,9 @@ typedef struct {
 } KERNEL;
 
 STATIC EFI_HANDLE  mImage;
-UINT64 EFIAPI DarwinCurrentEl (VOID);
-VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
-
-#define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
+STATIC UINT64             mImageBase;
+STATIC UINT64             mImageSize;
+STATIC DARWIN_CPU_HANDOFF mCpuHandoff;
 
 STATIC UINT32 U32 (CONST VOID *P) { return ReadUnaligned32 ((CONST UINT32 *)P); }
 STATIC UINT64 U64 (CONST VOID *P) { return ReadUnaligned64 ((CONST UINT64 *)P); }
@@ -267,7 +267,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked, DARWIN_BOOT_POLICY *BootPolicy)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -279,6 +279,9 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  AddonCandidate;
   UINTN  PolicyCandidate;
   UINTN  MemoryCandidate;
+  UINTN  BootCandidates[4];
+  UINTN  BootLengths[4];
+  UINTN  BootProperty;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -289,7 +292,8 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   AddonCandidate = MAX_UINTN;
   PolicyCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
-  if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
+  for (Index = 0; Index < ARRAY_SIZE (BootCandidates); Index++) { BootCandidates[Index] = MAX_UINTN; }
+  if ((Depth > 64) || (*Offset > Size) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
   *Offset += 8;
@@ -330,6 +334,16 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       MemoryCandidate = *Offset;
     }
+    BootProperty = MAX_UINTN;
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-args-abi") == 0) { BootProperty = DARWIN_POLICY_ARGS_ABI; }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-page-size") == 0) { BootProperty = DARWIN_POLICY_PAGE_SIZE; }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-boot-cpu") == 0) { BootProperty = DARWIN_POLICY_BOOT_CPU; }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "method") == 0) { BootProperty = DARWIN_POLICY_PSCI_METHOD; }
+    if (BootProperty != MAX_UINTN) {
+      if (BootCandidates[BootProperty] != MAX_UINTN) { return FALSE; }
+      BootCandidates[BootProperty] = *Offset;
+      BootLengths[BootProperty] = Length;
+    }
     *Offset += Length;
     if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
     *Offset = ALIGN_VALUE (*Offset, 4);
@@ -338,6 +352,15 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   if (Depth == 0) { Path = 0; }
   if ((Depth == 1) && (ParentPath == 0) && (NameLength == 7) && (CompareMem (Name, "chosen", 7) == 0)) { Path = 1; }
   if ((Depth == 2) && (ParentPath == 1) && (NameLength == 11) && (CompareMem (Name, "memory-map", 11) == 0)) { Path = 2; }
+  if ((Depth == 1) && (ParentPath == 0) && (NameLength == 5) && (CompareMem (Name, "psci", 5) == 0)) { Path = DARWIN_ADT_PSCI; }
+  if (!DarwinBootPolicyNode (BootPolicy, Path)) { return FALSE; }
+  for (BootProperty = 0; BootProperty < ARRAY_SIZE (BootCandidates); BootProperty++) {
+    if (BootCandidates[BootProperty] == MAX_UINTN) { continue; }
+    if (BootProperty == DARWIN_POLICY_PSCI_METHOD) {
+      if (Path != DARWIN_ADT_PSCI) { continue; }
+    } else if (Path != DARWIN_ADT_CHOSEN) { return FALSE; }
+    if (!DarwinBootPolicySet (BootPolicy, (UINT32)BootProperty, Data + BootCandidates[BootProperty], BootLengths[BootProperty])) { return FALSE; }
+  }
   if ((Path == 2) && (Candidate != MAX_UINTN)) {
     if (*RamdiskOffset != MAX_UINTN) { return FALSE; }
     *RamdiskOffset = Candidate;
@@ -361,7 +384,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked, BootPolicy)) { return FALSE; }
   }
   return TRUE;
 }
@@ -589,7 +612,10 @@ Boot (
   UINTN                           PolicySize;
   UINTN                           PolicyOffset;
   UINT64                          PolicyAddress;
-  DARWIN_BOOT_ARGS                *Args;
+  DARWIN_BOOT_ARGS23               ArgsValues;
+  DARWIN_BOOT_POLICY               BootPolicy;
+  UINT64                          CurrentCpu;
+  EFI_STATUS                      CleanupStatus;
   EFI_MEMORY_DESCRIPTOR           *Map;
   UINTN                           Capacity;
   UINTN                           MapSize;
@@ -602,6 +628,10 @@ Boot (
 
   (VOID)This;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
+  if (mCpuHandoff.Address != 0) {
+    Print (L"DARWINBOOT: CPU context retained; boot blocked until reset\n");
+    return EFI_NOT_READY;
+  }
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
       (DarwinCurrentEl () != 4)) {
     Print (L"DARWINBOOT: unsupported inputs or exception level; firmware retained\n");
@@ -611,16 +641,12 @@ Boot (
     Print (L"DARWINBOOT: ramdisk layout rejected, %lu bytes\n", (UINT64)Request->RamdiskSize);
     return EFI_BAD_BUFFER_SIZE;
   }
-  ZeroMem (CommandLine, sizeof (CommandLine));
-  if (Request->BootArgs != NULL) {
-    for (Index = 0; Request->BootArgs[Index] != 0; Index++) {
-      if ((Index >= sizeof (CommandLine) - 1) || (Request->BootArgs[Index] > 0x7f)) {
-        Print (L"DARWINBOOT: boot args rejected at %lu\n", (UINT64)Index);
-        return EFI_BAD_BUFFER_SIZE;
-      }
-      CommandLine[Index] = (CHAR8)Request->BootArgs[Index];
-    }
+  if (!DarwinBootCommandLine (CommandLine, sizeof (CommandLine), Request->BootArgs)) {
+    Print (L"DARWINBOOT: boot args rejected\n");
+    return EFI_BAD_BUFFER_SIZE;
   }
+  CurrentCpu = DarwinCurrentMpidr () & DARWIN_MPIDR_AFFINITY_MASK;
+  DarwinBootPolicyInit (&BootPolicy, CurrentCpu);
   Root = NULL;
   Image = NULL;
   Tree = NULL;
@@ -655,7 +681,18 @@ Boot (
   PolicyOffset = MAX_UINTN;
   WindowSize = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &BootPolicy) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (AsciiStrLen (CommandLine) >= DarwinBootCommandCapacity (BootPolicy.ArgsAbi)) {
+    Print (L"DARWINBOOT: Darwin %u command line exceeds %lu bytes\n", BootPolicy.ArgsAbi, (UINT64)DarwinBootCommandCapacity (BootPolicy.ArgsAbi) - 1);
+    Status = EFI_BAD_BUFFER_SIZE;
+    goto Fail;
+  }
+  if ((Kernel.Base & (BootPolicy.PageSize - 1)) != 0) { Status = EFI_LOAD_ERROR; goto Fail; }
+  if (((BootPolicy.BootCpu == CurrentCpu) && !DarwinBootGranuleSupported (DarwinMmfr0 (), BootPolicy.PageSize)) ||
+      ((BootPolicy.BootCpu != CurrentCpu) && (BootPolicy.PsciMethod == DARWIN_PSCI_NONE))) {
+    Status = EFI_UNSUPPORTED;
+    goto Fail;
+  }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -722,9 +759,9 @@ Boot (
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
   if (EFI_ERROR (Status)) { goto Fail; }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
-  TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
-  RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
-  RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
+  TreeAddress = ArgsAddress + BootPolicy.PageSize;
+  RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, BootPolicy.PageSize);
+  RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, BootPolicy.PageSize);
   TrustCacheAddress = RamdiskAddress + RamdiskBytes;
   AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
   PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
@@ -739,18 +776,21 @@ Boot (
     CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
              (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
   }
-  Args = (DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress;
-  Args->Revision = 2;
-  Args->Version = 2;
-  Args->VirtualBase = Kernel.Base;
-  Args->PhysicalBase = Address;
-  Args->MemorySize = WindowSize;
-  Args->MemorySizeActual = WindowSize;
-  Args->TopOfKernelData = Address + Used;
-  CopyMem (Args->Video, Video, sizeof (Video));
-  Args->DeviceTree = Kernel.Base + TreeAddress - Address;
-  Args->DeviceTreeLength = (UINT32)TreeSize;
-  CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
+  ZeroMem (&ArgsValues, sizeof (ArgsValues));
+  ArgsValues.Revision = 2;
+  ArgsValues.Version = 2;
+  ArgsValues.VirtualBase = Kernel.Base;
+  ArgsValues.PhysicalBase = Address;
+  ArgsValues.MemorySize = WindowSize;
+  ArgsValues.MemorySizeActual = WindowSize;
+  ArgsValues.TopOfKernelData = Address + Used;
+  CopyMem (ArgsValues.Video, Video, sizeof (Video));
+  ArgsValues.DeviceTree = Kernel.Base + TreeAddress - Address;
+  ArgsValues.DeviceTreeLength = (UINT32)TreeSize;
+  if (!DarwinBootArgsWrite ((VOID *)(UINTN)ArgsAddress, BootPolicy.PageSize, BootPolicy.ArgsAbi, &ArgsValues, CommandLine)) {
+    Status = EFI_BAD_BUFFER_SIZE;
+    goto Fail;
+  }
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
   if (Request->Ramdisk != NULL) {
     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
@@ -780,6 +820,19 @@ Boot (
   FreePool (Tree); Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
   Root->Close (Root); Root = NULL;
+  Status = DarwinCpuPrepare (&BootPolicy, CurrentCpu, ArgsAddress, Address + Kernel.Entry - Kernel.Base,
+                            mImageBase, mImageSize, &mCpuHandoff);
+  if (EFI_ERROR (Status)) {
+    Print (L"DARWINBOOT: CPU prepare failed: %r CPU_ON=%d affinity=%d\n", Status, mCpuHandoff.OnReturn, mCpuHandoff.LastAffinity);
+    goto Fail;
+  }
+  Print (L"DARWINBOOT: ABI=%u page=%u boot CPU=0x%lx current CPU=0x%lx\n",
+         BootPolicy.ArgsAbi, BootPolicy.PageSize, BootPolicy.BootCpu, CurrentCpu);
+  if (mCpuHandoff.Address != 0) {
+    DARWIN_CPU_CONTEXT *Context = (DARWIN_CPU_CONTEXT *)(UINTN)mCpuHandoff.Address;
+    Print (L"DARWINBOOT: target ready MPIDR=0x%lx EL%lu MMFR0=0x%lx SCTLR=0x%lx context=0x%lx\n",
+           Context->Report.Mpidr, Context->Report.CurrentEl >> 2, Context->Report.Mmfr0, Context->Report.Sctlr, mCpuHandoff.Address);
+  }
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
@@ -804,28 +857,39 @@ Boot (
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 4)),
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 8)),
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 12))));
-  DEBUG ((DEBUG_ERROR, "CurrentEL %lu  SCTLR_EL1 0x%lx  TCR_EL1 0x%lx\n", DarwinCurrentEl () >> 2, READ_SYSREG (sctlr_el1), READ_SYSREG (tcr_el1)));
-  DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", READ_SYSREG (id_aa64mmfr0_el1),
-          READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
-  DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
+  DEBUG ((DEBUG_ERROR, "CurrentEL %lu  SCTLR_EL1 0x%lx  TCR_EL1 0x%lx\n", DarwinCurrentEl () >> 2, DarwinSctlr (), DarwinTcr ()));
+  DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", DarwinMmfr0 (),
+          DarwinMmfr0 () & 0xF, DarwinBootGranuleSupported (DarwinMmfr0 (), 4096) ? "supported" : "NOT supported"));
+  DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", DarwinPfr0 ()));
   DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmarks the loader handoff before the kernel branch.\n"));
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
     if (EFI_ERROR (Status)) {
       if (Attempt == 0) { goto Fail; }
+      DarwinCpuAbort (&mCpuHandoff, FALSE);
       CpuDeadLoop ();
     }
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
+      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4], mCpuHandoff.Address);
       CpuDeadLoop ();
     }
-    if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }
+    if (Status != EFI_INVALID_PARAMETER) { DarwinCpuAbort (&mCpuHandoff, FALSE); CpuDeadLoop (); }
   }
+  DarwinCpuAbort (&mCpuHandoff, FALSE);
   CpuDeadLoop ();
   return EFI_ABORTED;
 Fail:
+  CleanupStatus = DarwinCpuAbort (&mCpuHandoff, TRUE);
+  if (EFI_ERROR (CleanupStatus)) {
+    Print (L"DARWINBOOT: CPU abort failed: %r affinity=%d; context retained, unload blocked\n", CleanupStatus, mCpuHandoff.LastAffinity);
+    if (mCpuHandoff.Launched) {
+      DARWIN_CPU_CONTEXT *Context = (DARWIN_CPU_CONTEXT *)(UINTN)mCpuHandoff.Address;
+      Print (L"DARWINBOOT: target state=%lu CPU_OFF return=0x%lx\n", Context->Report.State, Context->Report.OffReturn);
+    }
+    Status = CleanupStatus;
+  }
   if (Root != NULL) { Root->Close (Root); }
   if (Image != NULL) { FreePool (Image); }
   if (Tree != NULL) { FreePool (Tree); }
@@ -846,6 +910,7 @@ EFI_STATUS
 EFIAPI
 Unload (EFI_HANDLE ImageHandle)
 {
+  if (mCpuHandoff.Address != 0) { return EFI_ACCESS_DENIED; }
   return gBS->UninstallMultipleProtocolInterfaces (ImageHandle, &gUniXNULoaderProtocolGuid, &mLoader, NULL);
 }
 
@@ -863,6 +928,8 @@ DarwinBootEntry (EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
   Status = gBS->HandleProtocol (ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID **)&Loaded);
   if (EFI_ERROR (Status)) { return Status; }
   mImage = ImageHandle;
+  mImageBase = (UINT64)(UINTN)Loaded->ImageBase;
+  mImageSize = Loaded->ImageSize;
   Status = gBS->InstallMultipleProtocolInterfaces (&ImageHandle, &gUniXNULoaderProtocolGuid, &mLoader, NULL);
   if (!EFI_ERROR (Status)) {
     Loaded->Unload = Unload;

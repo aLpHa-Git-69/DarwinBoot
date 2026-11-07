@@ -9,10 +9,14 @@
 
 [Sources]
   DarwinBoot.c
+  CpuHandoff.c
+  CpuHandoff.h
+  BootPolicy.h
   PackedRamdisk.h
   BootArgs.h
   BootVideo.h
   DiagFont.h
+  WindowSize.h
   Entry.S
 
 [Packages]

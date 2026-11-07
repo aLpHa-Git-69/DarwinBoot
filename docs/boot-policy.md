@@ -60,6 +60,44 @@ placement use that granule. Kernel/physical base alignment must support it.
 Allocation still requires a real contiguous conventional-memory run and keeps
 the existing size limits; there is no assumed RAM address or fallback window.
 
+## Bootstrap bank placement
+
+XNU's initial L2 block mappings require matching virtual/physical phases at
+the **block** size, not just page alignment: 2 MiB for 4 KiB pages and 32 MiB
+for 16 KiB pages. For 4 KiB, the loader retains the linked base and the
+existing `ceil(descriptor start, 2 MiB) + linked base offset` allocation rule.
+
+For 16 KiB, after parsing the kernel and ADT policy, DarwinBoot rounds the
+minimum linked VA down to 32 MiB and declares that bank as `VirtualBase`.
+`AllocateWindow` requires a 32 MiB-aligned physical bank from an actual
+conventional-memory run. Segment, entry, argument and ADT offsets all refer
+to the same bank. The prefix is zeroed along with kernel BSS and payload
+storage. It is part of the requested ownership budget; the window is not
+enlarged by the prefix. Bank span/VA overflow and every aligned payload reserve
+are checked with the existing 2 MiB tail margin before copying or CPU startup.
+
+For the native 8796 kernel with SHA-256
+`24d6913756afe5f812c84f889c6c49c8dd3a0e08bc9177f0c183544f2a1d48b6`:
+
+| Item | Placement with a `0xa0000000` physical bank |
+| --- | --- |
+| Linked kernel header VA | `0xfffffe0007004000` |
+| `boot_args.VirtualBase` | `0xfffffe0006000000` |
+| `boot_args.PhysicalBase` / owned size | `0xa0000000` / `0x40000000` |
+| Copied header PA / entry PA | `0xa1004000` / `0xa14ba488` |
+| Actual linked segment end | `0xfffffe0008984000` |
+| Arguments PA / ADT PA | `0xa2984000` / `0xa2988000` |
+
+These addresses are calculated from the actual Mach-O, not loader constants.
+In particular, `0xa2934000` is inside this kernel's final segment and cannot
+be used for arguments. The probe's `0xa0004000..0xfeac0000` was an **aligned
+analysis candidate**, not a raw descriptor boundary. A conventional run
+starting at `0xa0000000` permits the bank above. If the first free descriptor
+really starts at `0xa0004000`, the first possible 32 MiB bank is `0xa2000000`;
+the header/entry become `0xa3004000`/`0xa34ba488`, with arguments/ADT at
+`0xa4984000`/`0xa4988000`. Allocation still needs the full requested window
+after that aligned start.
+
 ## CPU lifecycle
 
 For the current CPU, no migration context or PSCI call is needed. The loader
@@ -117,6 +155,8 @@ In the Lavender consuming workspace, run:
 
 ```sh
 python3 tests/darwin-checks.py --sanitize \
+  --kernel out/ios16-kernel/kernel.development.lavender \
+  --kernel-sha256 24d6913756afe5f812c84f889c6c49c8dd3a0e08bc9177f0c183544f2a1d48b6 \
   --output /data/data/com.termux/files/usr/tmp/opencode/darwinboot-checks
 ```
 
@@ -130,6 +170,14 @@ audits the real cold-entry section for relocations/stack/global references,
 links the assembly into a native PE test image, checks ELF assembly and runs
 the existing parser/RAM-disk/window tests. Command JSON, source hashes,
 disassembly and a scope-labelled report are saved with `--output`.
+
+With `--kernel`, the complete production loader runs on the supplied Mach-O
+through mock firmware boundaries at both physical banks above. The test
+poisons RAM, verifies every copied segment and zeroed prefix/BSS, and decodes
+the bootstrap block descriptors independently to check segment/argument/ADT
+translations. It also exercises prefix admission, tight payload bounds,
+arithmetic overflow, real descriptor starts and allocation failures. Omitting
+`--kernel` runs the synthetic ABI/state/bank suite without Apple input files.
 
 These are host and isolated compilation results. An integrated firmware/FD
 build and hardware XNU boot require the consuming board's CI/device checks.

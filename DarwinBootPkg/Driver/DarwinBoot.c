@@ -14,6 +14,7 @@
 #include <Protocol/SimpleFileSystem.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
+#include "BootstrapBank.h"
 #include "CpuHandoff.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
@@ -448,14 +449,15 @@ RunEnd (EFI_MEMORY_DESCRIPTOR *Map, UINTN Size, UINTN Stride, UINT64 Start, UINT
   EFI_MEMORY_DESCRIPTOR *Descriptor;
   UINTN                 Offset;
   BOOLEAN               Extended;
+  UINT64                NextEnd;
 
   do {
     Extended = FALSE;
     for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
       Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
       if ((Descriptor->Type == EfiConventionalMemory) && (Descriptor->PhysicalStart == End) &&
-          (Descriptor->NumberOfPages != 0) && (Descriptor->NumberOfPages < (MAX_UINT64 - End) / EFI_PAGE_SIZE)) {
-        End += EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
+          DarwinConventionalRangeEnd (Descriptor->PhysicalStart, Descriptor->NumberOfPages, &NextEnd)) {
+        End = NextEnd;
         Extended = TRUE;
       }
     }
@@ -515,7 +517,30 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
 
 STATIC
 EFI_STATUS
-AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
+PrepareKernelBank (KERNEL *Kernel, UINT32 PageSize, UINT64 WindowSize)
+{
+  UINT64 Base;
+  UINT64 Limit;
+  UINT64 Offset;
+  UINTN  Index;
+
+  if (!DarwinBootstrapBankBase (Kernel->Base, Kernel->End, PageSize, WindowSize, &Base)) { return EFI_LOAD_ERROR; }
+  Limit = WindowSize - BLOCK_SIZE;
+  if ((Kernel->Entry < Base) || (Kernel->Entry - Base >= Limit)) { return EFI_LOAD_ERROR; }
+  for (Index = 0; Index < Kernel->Count; Index++) {
+    if (Kernel->Segments[Index].Address < Base) { return EFI_LOAD_ERROR; }
+    Offset = Kernel->Segments[Index].Address - Base;
+    if ((Offset > Limit) || (Kernel->Segments[Index].Size > Limit - Offset)) { return EFI_LOAD_ERROR; }
+  }
+  // End, entry and segment addresses stay linked VAs. All later copy and
+  // boot_args offsets now refer to this same admitted bank base.
+  Kernel->Base = Base;
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+AllocateWindow (KERNEL *Kernel, UINT32 PageSize, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
 {
   EFI_MEMORY_DESCRIPTOR *Map;
   EFI_MEMORY_DESCRIPTOR *Descriptor;
@@ -541,13 +566,12 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   Status = EFI_OUT_OF_RESOURCES;
   for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
     Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
-    if ((Descriptor->Type != EfiConventionalMemory) || (Descriptor->NumberOfPages == 0)) { continue; }
-    End = RunEnd (Map, Size, Stride, Descriptor->PhysicalStart,
-                  Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
+    if ((Descriptor->Type != EfiConventionalMemory) ||
+        !DarwinConventionalRangeEnd (Descriptor->PhysicalStart, Descriptor->NumberOfPages, &End)) { continue; }
+    End = RunEnd (Map, Size, Stride, Descriptor->PhysicalStart, End);
     RunBytes = End - Descriptor->PhysicalStart;
     if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
-    Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
-    if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
+    if (!DarwinBootstrapCandidate (Descriptor->PhysicalStart, End, Kernel->Base, PageSize, WindowSize, &Candidate)) { continue; }
     Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
   }
@@ -598,6 +622,8 @@ Boot (
   UINT64                          TreeAddress;
   UINT64                          Used;
   UINT64                          WindowSize;
+  UINT64                          LinkedBase;
+  UINT64                          TopOfKernelData;
   UINT64                          RamdiskAddress;
   UINTN                           RamdiskOffset;
   UINTN                           RamdiskBytes;
@@ -667,6 +693,7 @@ Boot (
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
+  LinkedBase = Kernel.Base;
   Length = StrSize (Request->KernelPath);
   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
@@ -695,7 +722,8 @@ Boot (
   }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
-  if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
+  Status = PrepareKernelBank (&Kernel, BootPolicy.PageSize, WindowSize);
+  if (EFI_ERROR (Status)) { goto Fail; }
   if (Request->Ramdisk != NULL) {
     if ((RamdiskOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + RamdiskOffset) != 0) ||
         (U64 ((UINT8 *)Tree + RamdiskOffset + 8) != 0)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
@@ -756,24 +784,25 @@ Boot (
   }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
-  Status = AllocateWindow (&Kernel, WindowSize, &Address);
+  Status = AllocateWindow (&Kernel, BootPolicy.PageSize, WindowSize, &Address);
   if (EFI_ERROR (Status)) { goto Fail; }
-  ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
-  TreeAddress = ArgsAddress + BootPolicy.PageSize;
-  RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, BootPolicy.PageSize);
+  if (!DarwinBootstrapPhaseMatches (Kernel.Base, Address, BootPolicy.PageSize)) { Status = EFI_LOAD_ERROR; goto Fail; }
+  Used = Kernel.End - Kernel.Base;
   RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, BootPolicy.PageSize);
-  TrustCacheAddress = RamdiskAddress + RamdiskBytes;
-  AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
-  PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
-  Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
-  if (Used > WindowSize - BLOCK_SIZE) {
+  if (!DarwinBankReserve (Address, WindowSize - BLOCK_SIZE, &Used, SIZE_16KB, BootPolicy.PageSize, &ArgsAddress) ||
+      !DarwinBankReserve (Address, WindowSize - BLOCK_SIZE, &Used, 1, TreeSize, &TreeAddress) ||
+      !DarwinBankReserve (Address, WindowSize - BLOCK_SIZE, &Used, BootPolicy.PageSize, RamdiskBytes, &RamdiskAddress) ||
+      !DarwinBankReserve (Address, WindowSize - BLOCK_SIZE, &Used, 1, TrustCacheSize, &TrustCacheAddress) ||
+      !DarwinBankReserve (Address, WindowSize - BLOCK_SIZE, &Used, SIZE_16KB, AddonSize, &AddonAddress) ||
+      !DarwinBankReserve (Address, WindowSize - BLOCK_SIZE, &Used, SIZE_16KB, PolicySize, &PolicyAddress) ||
+      !DarwinBankReserve (Address, WindowSize - BLOCK_SIZE, &Used, SIZE_16KB, 0, &TopOfKernelData)) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
   ZeroMem ((VOID *)(UINTN)Address, (UINTN)Used);
   for (Index = 0; Index < Kernel.Count; Index++) {
-    CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
+    CopyMem ((VOID *)(UINTN)(Address + (Kernel.Segments[Index].Address - Kernel.Base)),
              (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
   }
   ZeroMem (&ArgsValues, sizeof (ArgsValues));
@@ -783,9 +812,9 @@ Boot (
   ArgsValues.PhysicalBase = Address;
   ArgsValues.MemorySize = WindowSize;
   ArgsValues.MemorySizeActual = WindowSize;
-  ArgsValues.TopOfKernelData = Address + Used;
+  ArgsValues.TopOfKernelData = TopOfKernelData;
   CopyMem (ArgsValues.Video, Video, sizeof (Video));
-  ArgsValues.DeviceTree = Kernel.Base + TreeAddress - Address;
+  ArgsValues.DeviceTree = Kernel.Base + (TreeAddress - Address);
   ArgsValues.DeviceTreeLength = (UINT32)TreeSize;
   if (!DarwinBootArgsWrite ((VOID *)(UINTN)ArgsAddress, BootPolicy.PageSize, BootPolicy.ArgsAbi, &ArgsValues, CommandLine)) {
     Status = EFI_BAD_BUFFER_SIZE;
@@ -820,7 +849,7 @@ Boot (
   FreePool (Tree); Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
   Root->Close (Root); Root = NULL;
-  Status = DarwinCpuPrepare (&BootPolicy, CurrentCpu, ArgsAddress, Address + Kernel.Entry - Kernel.Base,
+  Status = DarwinCpuPrepare (&BootPolicy, CurrentCpu, ArgsAddress, Address + (Kernel.Entry - Kernel.Base),
                             mImageBase, mImageSize, &mCpuHandoff);
   if (EFI_ERROR (Status)) {
     Print (L"DARWINBOOT: CPU prepare failed: %r CPU_ON=%d affinity=%d\n", Status, mCpuHandoff.OnReturn, mCpuHandoff.LastAffinity);
@@ -836,7 +865,9 @@ Boot (
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
-         Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+         Kernel.Base, Address, ArgsAddress, Address + (Kernel.Entry - Kernel.Base), (UINT64)WindowSize);
+  Print (L"DARWINBOOT: block=0x%lx linked header va=0x%lx pa=0x%lx span=0x%lx\n",
+         DarwinBootstrapBlockSize (BootPolicy.PageSize), LinkedBase, Address + (LinkedBase - Kernel.Base), Kernel.End - Kernel.Base);
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
   Print (L"DARWINBOOT: command line: %a\n", CommandLine);
@@ -849,14 +880,14 @@ Boot (
   //
   DEBUG ((DEBUG_ERROR, "\fDARWINBOOT: hand-off to the kernel\n\n"));
   DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
-  DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
+  DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + (Kernel.Entry - Kernel.Base)));
   DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
   DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
   DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 4)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 8)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 12))));
+          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + (Kernel.Entry - Kernel.Base))),
+          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + (Kernel.Entry - Kernel.Base) + 4)),
+          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + (Kernel.Entry - Kernel.Base) + 8)),
+          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + (Kernel.Entry - Kernel.Base) + 12))));
   DEBUG ((DEBUG_ERROR, "CurrentEL %lu  SCTLR_EL1 0x%lx  TCR_EL1 0x%lx\n", DarwinCurrentEl () >> 2, DarwinSctlr (), DarwinTcr ()));
   DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", DarwinMmfr0 (),
           DarwinMmfr0 () & 0xF, DarwinBootGranuleSupported (DarwinMmfr0 (), 4096) ? "supported" : "NOT supported"));
@@ -872,7 +903,7 @@ Boot (
     }
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4], mCpuHandoff.Address);
+      DarwinEnter (ArgsAddress, Address + (Kernel.Entry - Kernel.Base), Address, WindowSize, Video[0], Video[2] * Video[4], mCpuHandoff.Address);
       CpuDeadLoop ();
     }
     if (Status != EFI_INVALID_PARAMETER) { DarwinCpuAbort (&mCpuHandoff, FALSE); CpuDeadLoop (); }

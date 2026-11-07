@@ -44,6 +44,14 @@ Darwin 22 and 1,023 for Darwin 23. Oversized lines, malformed/duplicate policy
 properties and unsupported values are refused before `ExitBootServices`.
 The selected granule is checked on the CPU that will enter XNU.
 
+For 16 KiB pages, XNU's bootstrap L2 blocks are 32 MiB. DarwinBoot rounds the
+linked virtual base down to a 32 MiB bank, allocates a 32 MiB-aligned physical
+bank, and copies each segment at its linked offset within that bank. The
+zeroed prefix counts against the requested window. Arguments and ADT follow
+the actual segment end; this keeps their VA/PA block phases coherent. The
+4 KiB path retains its linked base and existing 2 MiB allocation rule. See
+[bootstrap bank placement](docs/boot-policy.md#bootstrap-bank-placement).
+
 Full interface, lifecycle and verification details:
 [English](docs/boot-policy.md) · [简体中文](docs/boot-policy.zh-CN.md).
 Host and isolated ARM64/COFF/PE checks are available at the consuming workspace's

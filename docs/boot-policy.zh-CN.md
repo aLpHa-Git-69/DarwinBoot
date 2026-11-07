@@ -55,6 +55,41 @@ darwinboot-memory-size = 0x40000000
 内核及物理基址必须满足对齐要求。分配仍依赖真实连续的
 `EfiConventionalMemory` 区间及原有大小限制，没有预设 RAM 地址或回退窗口。
 
+## Bootstrap bank 放置
+
+XNU 的初始 L2 block 映射要求 VA/PA 在 **block 大小** 上的相位一致，
+仅满足页对齐不够。4 KiB 页对应 2 MiB block，16 KiB 页对应 32 MiB block。
+4 KiB 路径保留链接基址，以及原有的“描述符起点向上对齐到 2 MiB，
+再加链接基址偏移”的分配规则。
+
+选择 16 KiB 时，解析内核和 ADT 策略后，DarwinBoot 将最低链接 VA
+向下对齐到 32 MiB，并将此 bank 写入 `VirtualBase`。`AllocateWindow`
+从真实连续的 conventional-memory 区间分配 32 MiB 对齐的物理 bank。
+内核段、入口、参数和 ADT 都使用相对于同一 bank 的偏移。前缀与内核
+BSS、负载区域一起清零，占用原有窗口预算，不额外扩大窗口。复制或
+启动目标 CPU 前，检查 bank 跨度、VA 溢出及每项负载的对齐/容量，
+保留原有 2 MiB 尾部余量。
+
+原生 8796 内核的 SHA-256 为
+`24d6913756afe5f812c84f889c6c49c8dd3a0e08bc9177f0c183544f2a1d48b6` 时：
+
+| 项目 | 物理 bank 为 `0xa0000000` 时的地址 |
+| --- | --- |
+| 内核头链接 VA | `0xfffffe0007004000` |
+| `boot_args.VirtualBase` | `0xfffffe0006000000` |
+| `boot_args.PhysicalBase` / 窗口大小 | `0xa0000000` / `0x40000000` |
+| 复制后的内核头 PA / 入口 PA | `0xa1004000` / `0xa14ba488` |
+| 实际链接段末尾 | `0xfffffe0008984000` |
+| 参数 PA / ADT PA | `0xa2984000` / `0xa2988000` |
+
+这些地址由实际 Mach-O 计算，不是加载器常量。`0xa2934000` 位于该内核
+最后一个段内，不能用来放置参数。探针报告的 `0xa0004000..0xfeac0000`
+是 **经过对齐分析的候选范围**，并非原始描述符边界。起于 `0xa0000000`
+的 conventional 区间允许上述 bank；若第一个空闲描述符实际起于
+`0xa0004000`，第一个可用 32 MiB bank 是 `0xa2000000`，内核头/入口
+变为 `0xa3004000`/`0xa34ba488`，参数/ADT 变为 `0xa4984000`/`0xa4988000`。
+对齐后的起点之后仍必须容纳完整请求窗口。
+
 ## CPU 生命周期
 
 选择当前 CPU 时，不分配迁移上下文，也不调用 PSCI。加载器检查该
@@ -105,6 +140,8 @@ MdePkg、UniXNUPkg 头文件及消费组件的 DSC/FDF。在已解析的 UniXNU
 
 ```sh
 python3 tests/darwin-checks.py --sanitize \
+  --kernel out/ios16-kernel/kernel.development.lavender \
+  --kernel-sha256 24d6913756afe5f812c84f889c6c49c8dd3a0e08bc9177f0c183544f2a1d48b6 \
   --output /data/data/com.termux/files/usr/tmp/opencode/darwinboot-checks
 ```
 
@@ -116,6 +153,13 @@ python3 tests/darwin-checks.py --sanitize \
 全局引用，将汇编链接为原生 PE 测试镜像，验证 ELF 汇编并运行现有
 解析器、RAM disk 和窗口测试。指定 `--output` 后保存命令 JSON、
 源码哈希、反汇编和标明验证范围的报告。
+
+指定 `--kernel` 后，完整生产加载器通过 mock 固件边界，使用输入
+Mach-O 在上述两个物理 bank 上运行。测试先填充非零 RAM，检查所有
+段的复制、前缀/BSS 清零，并独立解码 bootstrap block 描述符，验证
+段、参数和 ADT 的地址转换；同时覆盖前缀预算、紧窗口、算术溢出、
+真实描述符起点和分配失败。省略该选项时运行不需要 Apple 输入文件的
+合成 ABI/状态/bank 测试。
 
 以上属于主机及独立编译检查。完整固件/FD 构建和硬件 XNU 启动需要
 消费板级组件的 CI 与设备验证。

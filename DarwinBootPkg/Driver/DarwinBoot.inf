@@ -12,6 +12,7 @@
   CpuHandoff.c
   CpuHandoff.h
   BootPolicy.h
+  BootstrapBank.h
   PackedRamdisk.h
   BootArgs.h
   BootVideo.h
